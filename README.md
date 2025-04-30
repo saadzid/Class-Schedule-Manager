@@ -1,6 +1,6 @@
 # Class Schedule Manager
 
-![Class Schedule Manager Banner](https://via.placeholder.com/800x200.png?text=Class+Schedule+Manager)
+
 
 ## Overview
 
@@ -18,9 +18,6 @@ Class Schedule Manager is a robust desktop application for educational instituti
 - **Data Persistence**: Save schedule changes to Excel files
 - **User-Friendly Interface**: Clean and intuitive design for educational administrators
 
-## Screenshots
-
-![Application Screenshot](https://via.placeholder.com/800x450.png?text=Schedule+Manager+Screenshot)
 
 ## Requirements
 
