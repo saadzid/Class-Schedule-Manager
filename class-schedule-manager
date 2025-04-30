@@ -1,0 +1,911 @@
+import pandas as pd
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+from datetime import datetime, timedelta
+import numpy as np
+
+class ScheduleManager:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Class Schedule Manager")
+        self.file_path = None
+        self.df = None
+        # FIX: Improved drag_data structure to handle multi-directional dragging and ghost management
+        self.drag_data = {
+            "x": 0, "y": 0, 
+            "item": None, 
+            "idx": None, 
+            "day": None,
+            "ghost": None,
+            "orig_days": None,
+            "course_info": None,
+            "start_coords": None,
+            "drag_started": False
+        }
+        self.pixels_per_minute = 2
+        self.day_columns = {}
+        self.conflict_pairs = {}
+        self.current_room = None
+        self.all_days = ['U', 'M', 'T', 'W', 'R', 'F', 'S']
+        self.room_options = []
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # File controls
+        file_frame = ttk.Frame(main_frame)
+        file_frame.pack(fill=tk.X)
+
+        ttk.Button(file_frame, text="Load Schedule File", command=self.load_file).pack(side=tk.LEFT, padx=5)
+        ttk.Button(file_frame, text="Save Changes", command=self.save_file).pack(side=tk.LEFT, padx=5)
+        ttk.Button(file_frame, text="Save As New File", command=self.save_as_new_file).pack(side=tk.LEFT, padx=5)
+
+        # Conflict overview
+        conflict_frame = ttk.Frame(main_frame)
+        conflict_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        self.conflict_tree_vscroll = ttk.Scrollbar(conflict_frame, orient=tk.VERTICAL)
+        self.conflict_tree = ttk.Treeview(conflict_frame, columns=("Building", "Room", "Conflicts"),show="headings", height=5)
+        self.conflict_tree.heading("Building", text="Building")
+        self.conflict_tree.heading("Room", text="Room")
+        self.conflict_tree_vscroll.config(command=self.conflict_tree.yview)
+        self.conflict_tree.heading("Conflicts", text="Conflicts")
+        self.conflict_tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        self.conflict_tree_vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.conflict_tree.bind("<Double-1>", self.on_conflict_select)
+
+        # Manual room selection
+        manual_frame = ttk.Frame(main_frame)
+        manual_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(manual_frame, text="Building:").pack(side=tk.LEFT)
+        self.bldg_entry = ttk.Entry(manual_frame, width=8)
+        self.bldg_entry.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(manual_frame, text="Room:").pack(side=tk.LEFT)
+        self.room_entry = ttk.Entry(manual_frame, width=8)
+        self.room_entry.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(manual_frame, text="Show Schedule", command=self.show_manual_schedule).pack(side=tk.LEFT, padx=10)
+
+        # Search bar
+        search_frame = ttk.Frame(main_frame)
+        search_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(search_frame, text="Search Course:").pack(side=tk.LEFT)
+        self.search_entry = ttk.Entry(search_frame, width=15)
+        self.search_entry.pack(side=tk.LEFT, padx=5)
+        self.search_entry.bind("<KeyRelease>", self.filter_courses)
+        
+        # Search results with vertical scrollbar
+        search_results_frame = ttk.Frame(search_frame)
+        search_results_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False)  
+
+        self.search_results = tk.Listbox(search_results_frame, height=5, width=50)
+        self.search_results.pack(side=tk.LEFT, fill=tk.BOTH, expand=False)  
+
+        self.v_scroll_search = ttk.Scrollbar(search_results_frame, orient=tk.VERTICAL, command=self.search_results.yview)
+        self.v_scroll_search.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.search_results.config(yscrollcommand=self.v_scroll_search.set)
+        self.search_results.bind("<Double-1>", self.on_course_select)
+
+        # Calendar container
+        self.canvas_frame = ttk.Frame(main_frame)
+        self.canvas_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Time scale
+        self.time_canvas = tk.Canvas(self.canvas_frame, width=80, bg="white", bd=0, highlightthickness=0)
+        self.time_canvas.pack(side=tk.LEFT, fill=tk.Y)
+
+        # Calendar container with horizontal scroll
+        self.calendar_container = tk.Canvas(self.canvas_frame, bg="white", bd=0, highlightthickness=0)
+        self.calendar_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Inner frame for calendar
+        self.calendar_inner_frame = ttk.Frame(self.calendar_container)
+        self.calendar_container.create_window((0, 0), window=self.calendar_inner_frame, anchor="nw")
+
+        # Scrollbars
+        self.v_scroll = ttk.Scrollbar(self.canvas_frame, orient=tk.VERTICAL, command=self._on_vertical_scroll)
+        self.v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.h_scroll = ttk.Scrollbar(main_frame, orient=tk.HORIZONTAL, command=self._on_horizontal_scroll)
+        self.h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Configure scrolls
+        self.calendar_container.config(yscrollcommand=self.v_scroll.set, xscrollcommand=self.h_scroll.set)
+        self.time_canvas.config(yscrollcommand=self.v_scroll.set)
+
+        self.calendar_container.bind("<Configure>", lambda e: self.calendar_container.configure(scrollregion=self.calendar_container.bbox("all")))
+        self.calendar_container.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _on_vertical_scroll(self, *args):
+        self.calendar_container.yview(*args)
+        self.time_canvas.yview(*args)
+
+    def _on_horizontal_scroll(self, *args):
+        self.calendar_container.xview(*args)
+
+    def _on_mousewheel(self, event):
+        # Determine which widget is under the mouse 
+        x, y = event.x_root, event.y_root
+        widget = self.root.winfo_containing(x, y)
+        
+        # Check conflict tree hierarchy
+        conflict_widgets = [self.conflict_tree, self.conflict_tree_vscroll]
+        if any(widget == w or widget in w.winfo_children() for w in conflict_widgets):
+            self.conflict_tree.yview_scroll(-1 * (event.delta//120), "units")
+            return
+        
+        # Check search results hierarchy
+        search_widgets = [self.search_results, self.v_scroll_search]
+        if any(widget == w or widget in w.winfo_children() for w in search_widgets):
+            self.search_results.yview_scroll(-1 * (event.delta//120), "units")
+            return
+        
+        # Check calendar hierarchy
+        calendar_widgets = [self.calendar_container, self.time_canvas, 
+                           self.v_scroll, self.h_scroll]
+        if any(widget == w or widget in w.winfo_children() for w in calendar_widgets):
+            self.calendar_container.yview_scroll(-1 * (event.delta//120), "units")
+            self.time_canvas.yview_scroll(-1 * (event.delta//120), "units")
+
+    def format_time(self, time_str):
+        try:
+            digits = ''.join(c for c in str(time_str) if c.isdigit()).zfill(4)
+            return f"{digits[:2]}:{digits[2:]}"
+        except:
+            return "00:00"
+
+    def load_file(self):
+        self.root.config(cursor="watch")
+        try:
+            file_path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
+            if not file_path:
+                return
+
+            self.file_path = file_path
+            self.df = pd.read_excel(file_path)
+
+            # Clean data
+            self.df["Bldg"] = self.df["Bldg"].astype(str).str.strip().str.upper()
+            self.df["Room"] = self.df["Room"].astype(str).str.strip().str.upper()
+            self.df["Days"] = self.df["Days"].str.strip().str.upper()
+            self.room_options = self.df[['Bldg', 'Room']].drop_duplicates().values.tolist()
+
+            self.df["Course"] = self.df["Subject"].astype(str) + " " + self.df["Number"].astype(str)
+
+            for col in ["Start", "End"]:
+                self.df[col] = self.df[col].apply(self.format_time)
+
+            # Standardize the Days column
+            self.df["Days"] = self.df["Days"].apply(self.standardize_days)
+
+            self.df["Conflict"] = ""
+
+            if "Resolved Conflicts" not in self.df.columns:
+                self.df["Resolved Conflicts"] = ""
+            self.detect_conflicts()
+            self.show_conflict_overview()
+            messagebox.showinfo("Loaded", "Schedule loaded successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error loading file: {str(e)}")
+        finally:
+            self.root.config(cursor="")
+
+    def standardize_days(self, days):
+        # Handle repeated classes on specific days
+        if days == "MTWTH":
+            return "MWTh"
+        elif days == "ST":
+            return "STh"
+        elif days == "MW":
+            return "MW"
+        else:
+            return days
+
+    def detect_conflicts(self):
+        self.conflict_pairs.clear()
+        self.df["Conflict"] = ""
+
+        self.df["Start_dt"] = pd.to_datetime(self.df["Start"], format="%H:%M", errors="coerce")
+        self.df["End_dt"] = pd.to_datetime(self.df["End"], format="%H:%M", errors="coerce")
+
+        valid_df = self.df.dropna(subset=["Start_dt", "End_dt"])
+
+        grouped = valid_df.groupby(["Bldg", "Room", "Days"])
+
+        for name, group in grouped:
+            if len(group) < 2: continue
+
+            group = group.sort_values("Start_dt")
+            starts = group["Start_dt"].values
+            ends = group["End_dt"].values
+
+            overlap_matrix = (starts < ends[:, None]) & (ends > starts[:, None])
+            np.fill_diagonal(overlap_matrix, False)
+
+            conflicts = np.where(overlap_matrix)
+            for i, j in zip(*conflicts):
+                idx_i = group.index[i]
+                idx_j = group.index[j]
+
+                conflict_note = f"{self.df.at[idx_j, 'Course']} ({self.df.at[idx_j, 'Section']})"
+                self.df.at[idx_i, "Conflict"] = conflict_note if not self.df.at[idx_i, "Conflict"] else self.df.at[idx_i, "Conflict"] + "; " + conflict_note
+
+                conflict_note = f"{self.df.at[idx_i, 'Course']} ({self.df.at[idx_i, 'Section']})"
+                self.df.at[idx_j, "Conflict"] = conflict_note if not self.df.at[idx_j, "Conflict"] else self.df.at[idx_j, "Conflict"] + "; " + conflict_note
+
+        self.df.drop(columns=["Start_dt", "End_dt"], inplace=True)
+
+    def show_conflict_overview(self):
+        for item in self.conflict_tree.get_children():
+            self.conflict_tree.delete(item)
+
+        conflict_df = self.df[self.df["Conflict"] != ""]
+        if not conflict_df.empty:
+            grouped = conflict_df.groupby(["Bldg", "Room"]).size().reset_index(name="Conflicts")
+            for _, row in grouped.iterrows():
+                self.conflict_tree.insert("", tk.END, values=(row["Bldg"], row["Room"], row["Conflicts"]))
+
+    def on_conflict_select(self, event):
+        try:
+            item = self.conflict_tree.selection()[0]
+            bldg, room, _ = self.conflict_tree.item(item, "values")
+            self.load_room_schedule(bldg, room)
+            self.bldg_entry.delete(0, tk.END)
+            self.bldg_entry.insert(0, bldg)
+            self.room_entry.delete(0, tk.END)
+            self.room_entry.insert(0, room)
+        except Exception as e:
+            messagebox.showerror("Error", f"Couldn't load schedule: {str(e)}")
+
+    def show_manual_schedule(self):
+        bldg = self.bldg_entry.get().strip().upper()
+        room = self.room_entry.get().strip().upper()
+        self.load_room_schedule(bldg, room)
+
+    def load_room_schedule(self, building, room):
+        building = str(building).strip().upper()
+        room = str(room).strip().upper()
+
+        if not building or not room:
+            messagebox.showwarning("Warning", "Please enter both building and room number")
+            return
+
+        room_df = self.df[(self.df["Bldg"] == building) & (self.df["Room"] == room)]
+        if room_df.empty:
+            messagebox.showwarning("Warning", "No classes found for this room!")
+            return
+
+        self.current_room = (building, room)
+        self._draw_calendar(room_df)
+
+    def _draw_calendar(self, room_df):
+        self.time_canvas.delete("all")
+        for widget in self.calendar_inner_frame.winfo_children():
+            widget.destroy()
+
+        try:
+            times = pd.to_datetime(pd.concat([room_df["Start"], room_df["End"]]), format="%H:%M")
+            min_time = times.min().to_pydatetime()
+            max_time = times.max().to_pydatetime()
+        except:
+            min_time = datetime.strptime("08:00", "%H:%M")
+            max_time = datetime.strptime("18:00", "%H:%M")
+
+        time_height = (max_time - min_time).seconds // 60 * self.pixels_per_minute
+
+        # Draw time scale
+        current_time = min_time
+        while current_time <= max_time:
+            y_pos = self._time_to_y(current_time, min_time)
+            self.time_canvas.create_text(70, y_pos, text=current_time.strftime("%H:%M"), anchor=tk.E)
+            current_time += timedelta(minutes=60)
+
+        self.time_canvas.config(scrollregion=(0, 0, 80, time_height))
+
+        # Create day columns
+        col_width = 200
+        for day in self.all_days:
+            day_frame = ttk.Frame(self.calendar_inner_frame, width=col_width, height=time_height)
+            day_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+            # Header
+            header = ttk.Frame(day_frame, height=20, relief="solid")
+            header.pack(fill=tk.X)
+            ttk.Label(header, text=day, font=("Arial", 7, "bold")).pack(pady=2)
+
+            # Day canvas
+            day_canvas = tk.Canvas(day_frame, bg="#f0f0f0", height=time_height-20)
+            day_canvas.pack(fill=tk.BOTH, expand=True)
+            self.day_columns[day] = day_canvas
+
+            # Draw classes
+            day_df = room_df[room_df["Days"].apply(lambda x: day in x)]
+            for _, row in day_df.iterrows():
+                self._draw_class_block(day_canvas, row, min_time, day)
+
+        self.calendar_inner_frame.update_idletasks()
+        self.calendar_container.config(scrollregion=self.calendar_container.bbox("all"))
+
+    def _time_to_y(self, time, min_time):
+        delta = time - min_time
+        return delta.seconds // 60 * self.pixels_per_minute
+    
+    def _draw_class_block(self, canvas, row, min_time, day):
+        try:
+            start_time = datetime.strptime(row["Start"], "%H:%M")
+            end_time = datetime.strptime(row["End"], "%H:%M")
+        except:
+            return
+    
+        y_start = self._time_to_y(start_time, min_time)
+        height = (end_time - start_time).seconds // 60 * self.pixels_per_minute
+    
+        # Count number of conflicts
+        conflict_count = 0
+        if row["Conflict"]:
+            conflict_count = len(row["Conflict"].split(';'))
+    
+        color = "#ff9999" if conflict_count > 0 else "#99ccff"
+        
+        # Create the class block with proper tags
+        block = canvas.create_rectangle(10, y_start, 190, y_start + height,
+                                      fill=color,
+                                      tags=("class_block", str(row.name), day),
+                                      outline="#666666")
+    
+        # Create conflict counter badge
+        if conflict_count > 0:
+            badge_x = 180
+            badge_y = y_start + 10
+            canvas.create_oval(badge_x-10, badge_y-10, badge_x+10, badge_y+10,
+                             fill="red", outline="white", 
+                             tags=("badge", str(row.name), day))
+            canvas.create_text(badge_x, badge_y, text=str(conflict_count),
+                             fill="white", font=("Arial", 8, "bold"),
+                             tags=("badge_text", str(row.name), day))
+    
+        text = f"{row['Course']}\n{row['Start']}-{row['End']}"
+        canvas.create_text(100, y_start + height/2, text=text, width=180,
+                          justify=tk.CENTER, font=("Arial", 9),
+                          tags=("class_text", str(row.name), day))
+    
+        # Add binding for both left and right click
+        canvas.tag_bind(block, "<ButtonPress-1>", self._on_block_press)
+        canvas.tag_bind(block, "<B1-Motion>", self._on_block_drag)
+        canvas.tag_bind(block, "<ButtonRelease-1>", self._on_block_release)
+        
+        # Add right-click context menu binding
+        canvas.tag_bind(block, "<ButtonPress-3>", self._on_block_right_click)
+        
+    def prompt_conflict_resolution(self, idx):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Resolve Conflict")
+
+        ttk.Label(dialog, text="This class has a conflict. Which class would you like to edit?").grid(row=0, column=0, columnspan=2, padx=5, pady=5)
+
+        # Get conflicting classes 
+        conflict_notes = self.df.at[idx, "Conflict"].split('; ')
+        conflicting_courses = []
+        seen = set()
+        for note in conflict_notes:
+            if note.strip() and '(' in note:
+                course_part = note.split('(')[0].strip()
+                if course_part not in seen:
+                    conflicting_courses.append(course_part)
+                    seen.add(course_part)
+        
+        # Add current course
+        current_course = self.df.at[idx, "Course"]
+        if current_course not in seen:
+            conflicting_courses.append(current_course)
+
+        def safe_refresh():
+            """Safe wrapper for calendar refresh"""
+            try:
+                if self.current_room:
+                    self.load_room_schedule(*self.current_room)
+                dialog.destroy()  # Only close on success
+            except Exception as e:
+                messagebox.showerror("Error", f"Refresh failed: {str(e)}")
+                # Keep dialog open for corrections
+
+        def select_class_to_edit():
+            selected_class = class_var.get()
+            if selected_class:
+                selected_idx = self.df[self.df["Course"] == selected_class].index[0]
+                self.show_edit_dialog(selected_idx)
+                # Update resolved conflicts
+                self.df.at[idx, "Resolved Conflicts"] += f"\n{selected_class}"
+            else:
+                messagebox.showwarning("Warning", "Please select a class to edit.")
+
+        # Class selection dropdown
+        ttk.Label(dialog, text="Select a class to edit:").grid(row=1, column=0, padx=5, pady=5)
+        class_var = tk.StringVar()
+        class_combo = ttk.Combobox(dialog, textvariable=class_var, values=conflicting_courses)
+        class_combo.grid(row=1, column=1, padx=5, pady=5)
+
+        # Button setup
+        ttk.Button(dialog, text="Edit Selected Class", command=select_class_to_edit).grid(row=2, column=0, padx=5, pady=5)
+        ttk.Button(dialog, text="Cancel", command=dialog.destroy).grid(row=2, column=1, padx=5, pady=5)
+
+    # Handler for right-click (context menu) on class blocks
+    def _on_block_right_click(self, event):
+        item = event.widget.find_closest(event.x, event.y)[0]
+        tags = event.widget.gettags(item)
+        idx = int(tags[1])
+        self.show_edit_dialog(idx)
+        
+    def _on_block_press(self, event):
+        """Handle the initial press on a class block"""
+        try:
+            canvas = event.widget
+            # Find the item under cursor
+            item = canvas.find_closest(event.x, event.y)[0]
+            tags = canvas.gettags(item)
+            
+            # Validate tags - need at least 3 (block, idx, day)
+            if len(tags) < 3 or tags[0] != "class_block":
+                return
+                
+            idx = int(tags[1])
+            day = tags[2]
+            
+            # Get class information
+            class_row = self.df.iloc[idx]
+            
+            # Save initial state
+            self.drag_data = {
+                "item": item,
+                "idx": idx,
+                "day": day,
+                "canvas": canvas,
+                "start_point": (event.x, event.y),  # Screen coordinates
+                "orig_days": class_row["Days"],
+                "course": class_row["Course"],
+                "section": class_row["Section"],
+                "drag_started": False,
+                "ghost": None
+            }
+            
+            # Create a new ghost block
+            if self.drag_data["ghost"]:
+                # Clean up existing ghost if any
+                try:
+                    canvas.delete(self.drag_data["ghost"])
+                except:
+                    pass
+                    
+            # Create a new ghost rectangle - with simpler geometry
+            block_coords = canvas.coords(item)
+            if len(block_coords) == 4:  # Ensure we have rectangle coordinates
+                x1, y1, x2, y2 = block_coords
+                self.drag_data["original_geometry"] = (x1, y1, x2, y2)
+                
+                # Create ghost with tag, not storing reference to avoid stale references
+                canvas.create_rectangle(
+                    x1, y1, x2, y2,
+                    outline="blue", dash=(4, 4), width=2,
+                    fill="", tags=("ghost_rectangle",)
+                )
+        except Exception as e:
+            print(f"Press error: {e}")
+            # Reset drag data on error
+            self.drag_data = {}
+    
+    def _on_block_drag(self, event):
+        """Handle dragging movement of a class block"""
+        try:
+            # Verify we have valid drag data
+            if not self.drag_data or "start_point" not in self.drag_data:
+                return
+                
+            canvas = event.widget
+            
+            # Calculate delta from initial position
+            dx = event.x - self.drag_data["start_point"][0]
+            dy = event.y - self.drag_data["start_point"][1]
+            
+            # Only process if moved enough to register as a drag
+            if abs(dx) < 5 and abs(dy) < 5 and not self.drag_data.get("drag_started"):
+                return
+                
+            self.drag_data["drag_started"] = True
+            
+            # Update ghost position - first delete old one
+            canvas.delete("ghost_rectangle")
+            
+            # Get original geometry
+            if "original_geometry" not in self.drag_data:
+                return
+                
+            x1, y1, x2, y2 = self.drag_data["original_geometry"]
+            
+            # Create new ghost at updated position
+            canvas.create_rectangle(
+                x1 + dx, y1 + dy, x2 + dx, y2 + dy,
+                outline="blue", dash=(4, 4), width=2,
+                fill="", tags=("ghost_rectangle",)
+            )
+            
+            # Detect day target
+            self.drag_data["target_day"] = None
+            for day, day_canvas in self.day_columns.items():
+                # Get canvas position in root coordinates
+                x1 = day_canvas.winfo_rootx()
+                x2 = x1 + day_canvas.winfo_width()
+                y1 = day_canvas.winfo_rooty()
+                y2 = y1 + day_canvas.winfo_height()
+                
+                # Check if current mouse position is over this day canvas
+                if x1 <= event.x_root <= x2 and y1 <= event.y_root <= y2:
+                    self.drag_data["target_day"] = day
+                    day_canvas.config(highlightbackground="#a0a0ff", highlightthickness=2)
+                else:
+                    day_canvas.config(highlightbackground="#f0f0f0", highlightthickness=0)
+        except Exception as e:
+            print(f"Drag error: {e}")
+    
+    def _on_block_release(self, event):
+        """Handle the release of a dragged class block"""
+        try:
+            # First, clean up ghost
+            event.widget.delete("ghost_rectangle")
+            
+            # Verify we have valid drag data and drag was started
+            if not self.drag_data or not self.drag_data.get("drag_started", False):
+                return
+                
+            # Calculate total movement
+            dx = event.x - self.drag_data["start_point"][0]
+            dy = event.y - self.drag_data["start_point"][1]
+            
+            # Check if we've moved enough to trigger a change
+            significant_horizontal = abs(dx) > 20
+            significant_vertical = abs(dy) > 20
+            
+            day_changed = self.drag_data.get("target_day") != self.drag_data.get("day") and significant_horizontal
+            time_changed = significant_vertical
+            
+            if day_changed:
+                self._handle_day_change()
+                
+            if time_changed:
+                self._handle_time_change()
+                
+            # Update display if needed
+            if day_changed or time_changed:
+                self.detect_conflicts()
+                self.show_conflict_overview()
+                if self.current_room:
+                    self.load_room_schedule(*self.current_room)
+        except Exception as e:
+            messagebox.showerror("Error", f"Error updating schedule: {str(e)}")
+        finally:
+            # Clean up any canvas highlighting
+            for canvas in self.day_columns.values():
+                canvas.config(highlightbackground="#f0f0f0", highlightthickness=0)
+                
+            # Reset drag data
+            self.drag_data = {}
+
+    def _handle_time_change(self):
+        """Handle vertical dragging to change class time"""
+        try:
+            if "idx" not in self.drag_data:
+                return
+                
+            idx = self.drag_data["idx"]
+            canvas = self.drag_data.get("canvas")
+            
+            if not canvas:
+                return
+                
+            # Get room parameters with scroll consideration
+            if not self.current_room:
+                return
+                
+            room_df = self.df[(self.df["Bldg"] == self.current_room[0]) &
+                            (self.df["Room"] == self.current_room[1])]
+            
+            # Calculate time range
+            times = pd.to_datetime(pd.concat([room_df["Start"], room_df["End"]]).dropna(), 
+                                 format="%H:%M", errors="coerce")
+            if times.empty:
+                min_time = datetime.strptime("08:00", "%H:%M")
+            else:
+                min_time = times.min().to_pydatetime()
+            
+            # Get the y-position of where drag ended (with scroll adjustment)
+            canvas_scroll_y = self.calendar_container.yview()[0] * self.calendar_container.winfo_height()
+            drag_y_pos = canvas.winfo_pointery() - canvas.winfo_rooty() + canvas_scroll_y
+            
+            # Convert to minutes offset
+            minutes_offset = max(0, drag_y_pos // self.pixels_per_minute)
+            
+            # Apply to time
+            target_time = min_time + timedelta(minutes=minutes_offset)
+            
+            # Snap to nearest 15 minutes
+            minutes = target_time.minute
+            rounded_minutes = ((minutes + 7) // 15) * 15
+            if rounded_minutes == 60:
+                target_time = target_time.replace(hour=target_time.hour + 1, minute=0)
+            else:
+                target_time = target_time.replace(minute=rounded_minutes)
+            
+            # Get original class duration
+            try:
+                original_start = datetime.strptime(self.df.at[idx, "Start"], "%H:%M")
+                original_end = datetime.strptime(self.df.at[idx, "End"], "%H:%M")
+                duration = original_end - original_start
+            except:
+                # Default to 1 hour if times can't be parsed
+                duration = timedelta(hours=1)
+            
+            # Calculate new end time based on same duration
+            new_end_time = target_time + duration
+            
+            # Format times as strings
+            new_start = target_time.strftime("%H:%M")
+            new_end = new_end_time.strftime("%H:%M")
+            
+            # Validate and apply changes
+            if self.validate_time_change(idx, new_start, new_end):
+                # Get class details to find all matching classes
+                course = self.df.at[idx, "Course"]
+                section = self.df.at[idx, "Section"]
+                
+                # Update all instances of this class
+                matching_indices = self.df[(self.df["Course"] == course) & 
+                                       (self.df["Section"] == section)].index
+                
+                for match_idx in matching_indices:
+                    self.df.at[match_idx, "Start"] = new_start
+                    self.df.at[match_idx, "End"] = new_end
+                    
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to update time: {str(e)}")
+            
+    def _handle_day_change(self):
+        idx = self.drag_data["idx"]
+        target_day = self.drag_data["target_day"]
+        current_day = self.drag_data["day"]
+        
+        if target_day != current_day and target_day and current_day:
+            # Get original Days string
+            orig_days = self.drag_data["orig_days"]
+            course = self.df.at[idx, "Course"]
+            section = self.df.at[idx, "Section"]
+            
+            # Check if we're adding or removing a day
+            if current_day in orig_days and target_day not in orig_days:
+                # Adding a day
+                new_days = orig_days.replace(current_day, current_day + target_day)
+            elif current_day in orig_days:
+                # Moving a day (remove current, add target)
+                new_days = orig_days.replace(current_day, target_day)
+            else:
+                # Edge case - add target day
+                new_days = orig_days + target_day
+            
+            # Update all matching classes (same course & section)
+            matching_indices = self.df[(self.df["Course"] == course) & 
+                                   (self.df["Section"] == section)].index
+                                   
+            for match_idx in matching_indices:
+                self.df.at[match_idx, "Days"] = new_days
+    
+    def validate_time_change(self, idx, new_start, new_end):
+        try:
+            start_dt = datetime.strptime(new_start, "%H:%M")
+            end_dt = datetime.strptime(new_end, "%H:%M")
+            
+            # Validate time format and sequence
+            if start_dt >= end_dt:
+                messagebox.showerror("Invalid Time", "End time must be after start time.")
+                return False
+                
+            # Validate against business hours (optional)
+            if start_dt.hour < 6 or end_dt.hour > 23:
+                result = messagebox.askyesno("Unusual Hours", 
+                                             "This class would start before 6AM or end after 11PM. Continue?")
+                if not result:
+                    return False
+            return True
+        except ValueError:
+            messagebox.showerror("Invalid Time", "Could not parse time value.")
+            return False
+    
+    def show_edit_dialog(self, idx):
+        try:
+            row = self.df.iloc[idx]
+            dialog = tk.Toplevel(self.root)
+            dialog.title(f"Edit {row['Course']} ({row['Section']})")
+            
+            # Prepare fields
+            ttk.Label(dialog, text="Days:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+            days_entry = ttk.Entry(dialog, width=10)
+            days_entry.insert(0, row["Days"])
+            days_entry.grid(row=0, column=1, padx=5, pady=5)
+            
+            ttk.Label(dialog, text="Start Time:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+            start_entry = ttk.Entry(dialog, width=10)
+            start_entry.insert(0, row["Start"])
+            start_entry.grid(row=1, column=1, padx=5, pady=5)
+            
+            ttk.Label(dialog, text="End Time:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+            end_entry = ttk.Entry(dialog, width=10)
+            end_entry.insert(0, row["End"])
+            end_entry.grid(row=2, column=1, padx=5, pady=5)
+            
+            ttk.Label(dialog, text="Building:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
+            bldg_entry = ttk.Entry(dialog, width=10)
+            bldg_entry.insert(0, row["Bldg"])
+            bldg_entry.grid(row=3, column=1, padx=5, pady=5)
+            
+            ttk.Label(dialog, text="Room:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=5)
+            room_entry = ttk.Entry(dialog, width=10)
+            room_entry.insert(0, row["Room"])
+            room_entry.grid(row=4, column=1, padx=5, pady=5)
+            
+            # Add info about current conflicts
+            if row["Conflict"]:
+                conflict_frame = ttk.LabelFrame(dialog, text="Current Conflicts")
+                conflict_frame.grid(row=5, column=0, columnspan=2, sticky=tk.W+tk.E, padx=5, pady=5)
+                
+                conflicts_text = tk.Text(conflict_frame, height=4, width=40, wrap=tk.WORD)
+                conflicts_text.insert(tk.END, row["Conflict"])
+                conflicts_text.config(state=tk.DISABLED)
+                conflicts_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+            def safe_update():
+                """Safe wrapper for updates with validation"""
+                try:
+                    # Extract values
+                    new_days = days_entry.get().strip().upper()
+                    new_start = start_entry.get().strip()
+                    new_end = end_entry.get().strip()
+                    new_bldg = bldg_entry.get().strip().upper()
+                    new_room = room_entry.get().strip().upper()
+                    
+                    # Basic validation
+                    if not new_days or not new_start or not new_end or not new_bldg or not new_room:
+                        messagebox.showwarning("Warning", "All fields are required!")
+                        return
+                    
+                    # Time validation
+                    if not self.validate_time_change(idx, new_start, new_end):
+                        return
+                        
+                    # Get all matching classes (same course & section)
+                    course = row["Course"]
+                    section = row["Section"]
+                    matching_indices = self.df[(self.df["Course"] == course) & 
+                                          (self.df["Section"] == section)].index
+                    
+                    # Update all matching records to keep multi-day classes in sync
+                    for match_idx in matching_indices:
+                        self.df.at[match_idx, "Days"] = new_days
+                        self.df.at[match_idx, "Start"] = new_start
+                        self.df.at[match_idx, "End"] = new_end
+                        self.df.at[match_idx, "Bldg"] = new_bldg
+                        self.df.at[match_idx, "Room"] = new_room
+                    
+                    # Update display
+                    self.detect_conflicts()
+                    self.show_conflict_overview()
+                    
+                    # Only reload room if we're still viewing the same building/room
+                    if self.current_room and self.current_room[0] == row["Bldg"] and self.current_room[1] == row["Room"]:
+                        self.load_room_schedule(new_bldg, new_room)
+                    else:
+                        self.load_room_schedule(new_bldg, new_room)
+                        
+                    dialog.destroy()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Update failed: {str(e)}")
+            
+            # Button frame
+            btn_frame = ttk.Frame(dialog)
+            btn_frame.grid(row=6, column=0, columnspan=2, padx=5, pady=10)
+            
+            ttk.Button(btn_frame, text="Update", command=safe_update).pack(side=tk.LEFT, padx=5)
+            ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+            
+            # If class has conflicts, add resolve button
+            if row["Conflict"]:
+                ttk.Button(btn_frame, text="Resolve Conflicts", 
+                          command=lambda: self.prompt_conflict_resolution(idx)).pack(side=tk.LEFT, padx=5)
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open edit dialog: {str(e)}")
+    
+    def filter_courses(self, event=None):
+        search_text = self.search_entry.get().lower()
+        self.search_results.delete(0, tk.END)
+        
+        if not search_text:
+            return
+            
+        # Filter courses based on search text
+        matches = self.df[self.df["Course"].str.lower().str.contains(search_text)]
+        unique_matches = matches.drop_duplicates(subset=["Course", "Section"])
+        
+        for _, row in unique_matches.iterrows():
+            display_text = f"{row['Course']} - {row['Section']} ({row['Title']})"
+            self.search_results.insert(tk.END, display_text)
+            
+    def on_course_select(self, event):
+        try:
+            selection = self.search_results.get(self.search_results.curselection())
+            if not selection:
+                return
+                
+            # Extract course and section
+            parts = selection.split(" - ")
+            if len(parts) < 2:
+                return
+                
+            course = parts[0].strip()
+            section = parts[1].split(" ")[0].strip()
+            
+            # Find matching record
+            matches = self.df[(self.df["Course"] == course) & (self.df["Section"] == section)]
+            if not matches.empty:
+                first_idx = matches.index[0]
+                
+                # Support both double-click to show building/room and edit class
+                if not self.current_room:
+                    # If no room loaded, load this class's room
+                    self.load_room_schedule(matches.iloc[0]["Bldg"], matches.iloc[0]["Room"])
+                    self.bldg_entry.delete(0, tk.END)
+                    self.bldg_entry.insert(0, matches.iloc[0]["Bldg"])
+                    self.room_entry.delete(0, tk.END)
+                    self.room_entry.insert(0, matches.iloc[0]["Room"])
+                else:
+                    # If room already loaded, show edit dialog
+                    self.show_edit_dialog(first_idx)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not select course: {str(e)}")
+    
+    def save_file(self):
+        try:
+            if not self.file_path:
+                self.save_as_new_file()
+                return
+                
+            self.df.to_excel(self.file_path, index=False)
+            messagebox.showinfo("Success", "File saved successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save file: {str(e)}")
+            
+    def save_as_new_file(self):
+        try:
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel Files", "*.xlsx")]
+            )
+            
+            if not file_path:
+                return
+                
+            self.file_path = file_path
+            self.df.to_excel(file_path, index=False)
+            messagebox.showinfo("Success", "File saved successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save file: {str(e)}")
+    
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.geometry("1200x800")
+    app = ScheduleManager(root)
+    root.mainloop()
