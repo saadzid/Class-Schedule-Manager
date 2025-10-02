@@ -1,0 +1,977 @@
+import pandas as pd
+import customtkinter as ctk
+from tkinter import filedialog, messagebox, Canvas, Scrollbar
+from datetime import datetime, timedelta
+import numpy as np
+
+# Set appearance mode and color theme
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+class ScheduleManager:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Class Schedule Manager")
+        self.file_path = None
+        self.df = None
+        self.drag_data = {
+            "x": 0, "y": 0, 
+            "item": None, 
+            "idx": None, 
+            "day": None,
+            "ghost": None,
+            "orig_days": None,
+            "course_info": None,
+            "start_coords": None,
+            "drag_started": False
+        }
+        self.pixels_per_minute = 2
+        self.day_columns = {}
+        self.conflict_pairs = {}
+        self.current_room = None
+        self.all_days = ['U', 'M', 'T', 'W', 'R', 'F', 'S']
+        self.room_options = []
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        # Main container with padding
+        main_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Header section
+        header_frame = ctk.CTkFrame(main_frame, fg_color="#1a1a1a", corner_radius=15)
+        header_frame.pack(fill="x", pady=(0, 15))
+
+        title_label = ctk.CTkLabel(
+            header_frame, 
+            text="📅 Class Schedule Manager",
+            font=ctk.CTkFont(size=24, weight="bold")
+        )
+        title_label.pack(pady=20)
+
+        # File controls with modern buttons
+        file_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        file_frame.pack(fill="x", pady=(0, 15))
+
+        ctk.CTkButton(
+            file_frame, 
+            text="📂 Load Schedule",
+            command=self.load_file,
+            height=40,
+            corner_radius=10,
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            file_frame,
+            text="💾 Save Changes",
+            command=self.save_file,
+            height=40,
+            corner_radius=10,
+            fg_color="#2d7d46",
+            hover_color="#1f5c32",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            file_frame,
+            text="📄 Save As New",
+            command=self.save_as_new_file,
+            height=40,
+            corner_radius=10,
+            fg_color="#2d5a7d",
+            hover_color="#1f4159",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=5)
+
+        # Conflicts section with modern card design
+        conflict_card = ctk.CTkFrame(main_frame, corner_radius=15)
+        conflict_card.pack(fill="both", expand=True, pady=(0, 15))
+
+        conflict_header = ctk.CTkLabel(
+            conflict_card,
+            text="⚠️ Conflicts Overview",
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        conflict_header.pack(pady=(15, 10), padx=15, anchor="w")
+
+        # Conflict tree (using tkinter for table functionality)
+        tree_frame = ctk.CTkFrame(conflict_card, fg_color="#2b2b2b", corner_radius=10)
+        tree_frame.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+
+        import tkinter as tk
+        from tkinter import ttk
+        
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", 
+                       background="#2b2b2b",
+                       foreground="white",
+                       fieldbackground="#2b2b2b",
+                       borderwidth=0,
+                       font=('Segoe UI', 10))
+        style.configure("Treeview.Heading",
+                       background="#1f538d",
+                       foreground="white",
+                       borderwidth=0,
+                       font=('Segoe UI', 11, 'bold'))
+        style.map('Treeview', background=[('selected', '#1f538d')])
+
+        self.conflict_tree_vscroll = Scrollbar(tree_frame, orient="vertical")
+        self.conflict_tree = ttk.Treeview(
+            tree_frame,
+            columns=("Building", "Room", "Conflicts"),
+            show="headings",
+            height=5,
+            yscrollcommand=self.conflict_tree_vscroll.set
+        )
+        self.conflict_tree_vscroll.config(command=self.conflict_tree.yview)
+        
+        self.conflict_tree.heading("Building", text="Building")
+        self.conflict_tree.heading("Room", text="Room")
+        self.conflict_tree.heading("Conflicts", text="Conflicts")
+        
+        self.conflict_tree.column("Building", width=100, anchor="center")
+        self.conflict_tree.column("Room", width=100, anchor="center")
+        self.conflict_tree.column("Conflicts", width=100, anchor="center")
+        
+        self.conflict_tree.pack(fill="both", expand=True, side="left", padx=5, pady=5)
+        self.conflict_tree_vscroll.pack(side="right", fill="y")
+        self.conflict_tree.bind("<Double-1>", self.on_conflict_select)
+
+        # Manual room selection
+        manual_card = ctk.CTkFrame(main_frame, corner_radius=15)
+        manual_card.pack(fill="x", pady=(0, 15))
+
+        manual_label = ctk.CTkLabel(
+            manual_card,
+            text="🏢 Room Selection",
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        manual_label.pack(pady=(15, 10), padx=15, anchor="w")
+
+        manual_inner = ctk.CTkFrame(manual_card, fg_color="transparent")
+        manual_inner.pack(fill="x", padx=15, pady=(0, 15))
+
+        ctk.CTkLabel(manual_inner, text="Building:", font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 5))
+        self.bldg_entry = ctk.CTkEntry(manual_inner, width=100, height=35, corner_radius=8)
+        self.bldg_entry.pack(side="left", padx=5)
+
+        ctk.CTkLabel(manual_inner, text="Room:", font=ctk.CTkFont(size=12)).pack(side="left", padx=(15, 5))
+        self.room_entry = ctk.CTkEntry(manual_inner, width=100, height=35, corner_radius=8)
+        self.room_entry.pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            manual_inner,
+            text="🔍 Show Schedule",
+            command=self.show_manual_schedule,
+            height=35,
+            corner_radius=8,
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=15)
+
+        # Search section
+        search_card = ctk.CTkFrame(main_frame, corner_radius=15)
+        search_card.pack(fill="both", expand=True, pady=(0, 15))
+
+        search_label = ctk.CTkLabel(
+            search_card,
+            text="🔎 Course Search",
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        search_label.pack(pady=(15, 10), padx=15, anchor="w")
+
+        search_inner = ctk.CTkFrame(search_card, fg_color="transparent")
+        search_inner.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+
+        self.search_entry = ctk.CTkEntry(
+            search_inner,
+            placeholder_text="Type course name or number...",
+            height=35,
+            corner_radius=8,
+            font=ctk.CTkFont(size=12)
+        )
+        self.search_entry.pack(fill="x", pady=(0, 10))
+        self.search_entry.bind("<KeyRelease>", self.filter_courses)
+
+        # Search results with scrollbar
+        results_frame = ctk.CTkFrame(search_inner, fg_color="#2b2b2b", corner_radius=10)
+        results_frame.pack(fill="both", expand=True)
+
+        import tkinter as tk
+        self.search_results = tk.Listbox(
+            results_frame,
+            height=5,
+            bg="#2b2b2b",
+            fg="white",
+            selectbackground="#1f538d",
+            selectforeground="white",
+            font=('Segoe UI', 10),
+            borderwidth=0,
+            highlightthickness=0
+        )
+        self.search_results.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+
+        self.v_scroll_search = Scrollbar(results_frame, orient="vertical", command=self.search_results.yview)
+        self.v_scroll_search.pack(side="right", fill="y")
+        self.search_results.config(yscrollcommand=self.v_scroll_search.set)
+        self.search_results.bind("<Double-1>", self.on_course_select)
+
+        # Calendar section
+        calendar_card = ctk.CTkFrame(main_frame, corner_radius=15)
+        calendar_card.pack(fill="both", expand=True)
+
+        calendar_label = ctk.CTkLabel(
+            calendar_card,
+            text="📆 Weekly Schedule",
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        calendar_label.pack(pady=(15, 10), padx=15, anchor="w")
+
+        self.canvas_frame = ctk.CTkFrame(calendar_card, fg_color="#2b2b2b", corner_radius=10)
+        self.canvas_frame.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+
+        # Time scale
+        self.time_canvas = Canvas(self.canvas_frame, width=80, bg="#2b2b2b", bd=0, highlightthickness=0)
+        self.time_canvas.pack(side="left", fill="y")
+
+        # Calendar container
+        self.calendar_container = Canvas(self.canvas_frame, bg="#2b2b2b", bd=0, highlightthickness=0)
+        self.calendar_container.pack(side="left", fill="both", expand=True)
+
+        # Inner frame for calendar
+        self.calendar_inner_frame = ctk.CTkFrame(self.calendar_container, fg_color="transparent")
+        self.calendar_container.create_window((0, 0), window=self.calendar_inner_frame, anchor="nw")
+
+        # Scrollbars
+        self.v_scroll = Scrollbar(self.canvas_frame, orient="vertical", command=self._on_vertical_scroll)
+        self.v_scroll.pack(side="right", fill="y")
+
+        self.h_scroll = Scrollbar(calendar_card, orient="horizontal", command=self._on_horizontal_scroll)
+        self.h_scroll.pack(side="bottom", fill="x", padx=15, pady=(0, 10))
+
+        # Configure scrolls
+        self.calendar_container.config(yscrollcommand=self.v_scroll.set, xscrollcommand=self.h_scroll.set)
+        self.time_canvas.config(yscrollcommand=self.v_scroll.set)
+
+        self.calendar_container.bind("<Configure>", lambda e: self.calendar_container.configure(scrollregion=self.calendar_container.bbox("all")))
+        self.calendar_container.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _on_vertical_scroll(self, *args):
+        self.calendar_container.yview(*args)
+        self.time_canvas.yview(*args)
+
+    def _on_horizontal_scroll(self, *args):
+        self.calendar_container.xview(*args)
+
+    def _on_mousewheel(self, event):
+        x, y = event.x_root, event.y_root
+        widget = self.root.winfo_containing(x, y)
+        
+        conflict_widgets = [self.conflict_tree, self.conflict_tree_vscroll]
+        if any(widget == w or widget in w.winfo_children() for w in conflict_widgets):
+            self.conflict_tree.yview_scroll(-1 * (event.delta//120), "units")
+            return
+        
+        search_widgets = [self.search_results, self.v_scroll_search]
+        if any(widget == w or widget in w.winfo_children() for w in search_widgets):
+            self.search_results.yview_scroll(-1 * (event.delta//120), "units")
+            return
+        
+        calendar_widgets = [self.calendar_container, self.time_canvas, self.v_scroll, self.h_scroll]
+        if any(widget == w or widget in w.winfo_children() for w in calendar_widgets):
+            self.calendar_container.yview_scroll(-1 * (event.delta//120), "units")
+            self.time_canvas.yview_scroll(-1 * (event.delta//120), "units")
+
+    def format_time(self, time_str):
+        try:
+            digits = ''.join(c for c in str(time_str) if c.isdigit()).zfill(4)
+            return f"{digits[:2]}:{digits[2:]}"
+        except:
+            return "00:00"
+
+    def load_file(self):
+        self.root.config(cursor="watch")
+        try:
+            file_path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
+            if not file_path:
+                return
+
+            self.file_path = file_path
+            self.df = pd.read_excel(file_path)
+
+            self.df["Bldg"] = self.df["Bldg"].astype(str).str.strip().str.upper()
+            self.df["Room"] = self.df["Room"].astype(str).str.strip().str.upper()
+            self.df["Days"] = self.df["Days"].str.strip().str.upper()
+            self.room_options = self.df[['Bldg', 'Room']].drop_duplicates().values.tolist()
+
+            self.df["Course"] = self.df["Subject"].astype(str) + " " + self.df["Number"].astype(str)
+
+            for col in ["Start", "End"]:
+                self.df[col] = self.df[col].apply(self.format_time)
+
+            self.df["Days"] = self.df["Days"].apply(self.standardize_days)
+            self.df["Conflict"] = ""
+
+            if "Resolved Conflicts" not in self.df.columns:
+                self.df["Resolved Conflicts"] = ""
+            self.detect_conflicts()
+            self.show_conflict_overview()
+            messagebox.showinfo("Success", "Schedule loaded successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error loading file: {str(e)}")
+        finally:
+            self.root.config(cursor="")
+
+    def standardize_days(self, days):
+        if days == "MTWTH":
+            return "MWTh"
+        elif days == "ST":
+            return "STh"
+        elif days == "MW":
+            return "MW"
+        else:
+            return days
+
+    def detect_conflicts(self):
+        self.conflict_pairs.clear()
+        self.df["Conflict"] = ""
+
+        self.df["Start_dt"] = pd.to_datetime(self.df["Start"], format="%H:%M", errors="coerce")
+        self.df["End_dt"] = pd.to_datetime(self.df["End"], format="%H:%M", errors="coerce")
+
+        valid_df = self.df.dropna(subset=["Start_dt", "End_dt"])
+        grouped = valid_df.groupby(["Bldg", "Room", "Days"])
+
+        for name, group in grouped:
+            if len(group) < 2: continue
+
+            group = group.sort_values("Start_dt")
+            starts = group["Start_dt"].values
+            ends = group["End_dt"].values
+
+            overlap_matrix = (starts < ends[:, None]) & (ends > starts[:, None])
+            np.fill_diagonal(overlap_matrix, False)
+
+            conflicts = np.where(overlap_matrix)
+            for i, j in zip(*conflicts):
+                idx_i = group.index[i]
+                idx_j = group.index[j]
+
+                conflict_note = f"{self.df.at[idx_j, 'Course']} ({self.df.at[idx_j, 'Section']})"
+                self.df.at[idx_i, "Conflict"] = conflict_note if not self.df.at[idx_i, "Conflict"] else self.df.at[idx_i, "Conflict"] + "; " + conflict_note
+
+                conflict_note = f"{self.df.at[idx_i, 'Course']} ({self.df.at[idx_i, 'Section']})"
+                self.df.at[idx_j, "Conflict"] = conflict_note if not self.df.at[idx_j, "Conflict"] else self.df.at[idx_j, "Conflict"] + "; " + conflict_note
+
+        self.df.drop(columns=["Start_dt", "End_dt"], inplace=True)
+
+    def show_conflict_overview(self):
+        for item in self.conflict_tree.get_children():
+            self.conflict_tree.delete(item)
+
+        conflict_df = self.df[self.df["Conflict"] != ""]
+        if not conflict_df.empty:
+            grouped = conflict_df.groupby(["Bldg", "Room"]).size().reset_index(name="Conflicts")
+            for _, row in grouped.iterrows():
+                self.conflict_tree.insert("", "end", values=(row["Bldg"], row["Room"], row["Conflicts"]))
+
+    def on_conflict_select(self, event):
+        try:
+            item = self.conflict_tree.selection()[0]
+            bldg, room, _ = self.conflict_tree.item(item, "values")
+            self.load_room_schedule(bldg, room)
+            self.bldg_entry.delete(0, "end")
+            self.bldg_entry.insert(0, bldg)
+            self.room_entry.delete(0, "end")
+            self.room_entry.insert(0, room)
+        except Exception as e:
+            messagebox.showerror("Error", f"Couldn't load schedule: {str(e)}")
+
+    def show_manual_schedule(self):
+        bldg = self.bldg_entry.get().strip().upper()
+        room = self.room_entry.get().strip().upper()
+        self.load_room_schedule(bldg, room)
+
+    def load_room_schedule(self, building, room):
+        building = str(building).strip().upper()
+        room = str(room).strip().upper()
+
+        if not building or not room:
+            messagebox.showwarning("Warning", "Please enter both building and room number")
+            return
+
+        room_df = self.df[(self.df["Bldg"] == building) & (self.df["Room"] == room)]
+        if room_df.empty:
+            messagebox.showwarning("Warning", "No classes found for this room!")
+            return
+
+        self.current_room = (building, room)
+        self._draw_calendar(room_df)
+
+    def _draw_calendar(self, room_df):
+        self.time_canvas.delete("all")
+        for widget in self.calendar_inner_frame.winfo_children():
+            widget.destroy()
+
+        try:
+            times = pd.to_datetime(pd.concat([room_df["Start"], room_df["End"]]), format="%H:%M")
+            min_time = times.min().to_pydatetime()
+            max_time = times.max().to_pydatetime()
+        except:
+            min_time = datetime.strptime("08:00", "%H:%M")
+            max_time = datetime.strptime("18:00", "%H:%M")
+
+        time_height = (max_time - min_time).seconds // 60 * self.pixels_per_minute
+
+        # Draw time scale with modern styling
+        current_time = min_time
+        while current_time <= max_time:
+            y_pos = self._time_to_y(current_time, min_time)
+            self.time_canvas.create_text(70, y_pos, text=current_time.strftime("%H:%M"), 
+                                        anchor="e", fill="white", font=('Segoe UI', 10))
+            current_time += timedelta(minutes=60)
+
+        self.time_canvas.config(scrollregion=(0, 0, 80, time_height))
+
+        # Create day columns with modern styling
+        col_width = 200
+        day_labels = {'U': 'Sunday', 'M': 'Monday', 'T': 'Tuesday', 'W': 'Wednesday', 
+                     'R': 'Thursday', 'F': 'Friday', 'S': 'Saturday'}
+        
+        for day in self.all_days:
+            day_frame = ctk.CTkFrame(self.calendar_inner_frame, width=col_width, height=time_height,
+                                    fg_color="#1a1a1a", corner_radius=10)
+            day_frame.pack(side="left", fill="y", padx=5)
+
+            # Modern header
+            header = ctk.CTkFrame(day_frame, height=40, fg_color="#1f538d", corner_radius=8)
+            header.pack(fill="x", padx=2, pady=2)
+            ctk.CTkLabel(header, text=day_labels.get(day, day), 
+                        font=ctk.CTkFont(size=12, weight="bold")).pack(pady=10)
+
+            # Day canvas
+            day_canvas = Canvas(day_frame, bg="#2b2b2b", height=time_height-40, 
+                              highlightthickness=0, borderwidth=0)
+            day_canvas.pack(fill="both", expand=True, padx=2, pady=2)
+            self.day_columns[day] = day_canvas
+
+            # Draw classes
+            day_df = room_df[room_df["Days"].apply(lambda x: day in x)]
+            for _, row in day_df.iterrows():
+                self._draw_class_block(day_canvas, row, min_time, day)
+
+        self.calendar_inner_frame.update_idletasks()
+        self.calendar_container.config(scrollregion=self.calendar_container.bbox("all"))
+
+    def _time_to_y(self, time, min_time):
+        delta = time - min_time
+        return delta.seconds // 60 * self.pixels_per_minute
+    
+    def _draw_class_block(self, canvas, row, min_time, day):
+        try:
+            start_time = datetime.strptime(row["Start"], "%H:%M")
+            end_time = datetime.strptime(row["End"], "%H:%M")
+        except:
+            return
+    
+        y_start = self._time_to_y(start_time, min_time)
+        height = (end_time - start_time).seconds // 60 * self.pixels_per_minute
+    
+        conflict_count = 0
+        if row["Conflict"]:
+            conflict_count = len(row["Conflict"].split(';'))
+    
+        # Modern gradient colors
+        color = "#e74c3c" if conflict_count > 0 else "#3498db"
+        
+        block = canvas.create_rectangle(10, y_start, 190, y_start + height,
+                                      fill=color,
+                                      tags=("class_block", str(row.name), day),
+                                      outline="", width=0)
+    
+        # Modern conflict badge
+        if conflict_count > 0:
+            badge_x = 175
+            badge_y = y_start + 15
+            canvas.create_oval(badge_x-12, badge_y-12, badge_x+12, badge_y+12,
+                             fill="#c0392b", outline="white", width=2,
+                             tags=("badge", str(row.name), day))
+            canvas.create_text(badge_x, badge_y, text=str(conflict_count),
+                             fill="white", font=("Segoe UI", 9, "bold"),
+                             tags=("badge_text", str(row.name), day))
+    
+        text = f"{row['Course']}\n{row['Start']}-{row['End']}"
+        canvas.create_text(100, y_start + height/2, text=text, width=170,
+                          justify="center", font=("Segoe UI", 10), fill="white",
+                          tags=("class_text", str(row.name), day))
+    
+        canvas.tag_bind(block, "<ButtonPress-1>", self._on_block_press)
+        canvas.tag_bind(block, "<B1-Motion>", self._on_block_drag)
+        canvas.tag_bind(block, "<ButtonRelease-1>", self._on_block_release)
+        canvas.tag_bind(block, "<ButtonPress-3>", self._on_block_right_click)
+        
+    def _on_block_right_click(self, event):
+        item = event.widget.find_closest(event.x, event.y)[0]
+        tags = event.widget.gettags(item)
+        idx = int(tags[1])
+        self.show_edit_dialog(idx)
+        
+    def _on_block_press(self, event):
+        try:
+            canvas = event.widget
+            item = canvas.find_closest(event.x, event.y)[0]
+            tags = canvas.gettags(item)
+            
+            if len(tags) < 3 or tags[0] != "class_block":
+                return
+                
+            idx = int(tags[1])
+            day = tags[2]
+            class_row = self.df.iloc[idx]
+            
+            self.drag_data = {
+                "item": item,
+                "idx": idx,
+                "day": day,
+                "canvas": canvas,
+                "start_point": (event.x, event.y),
+                "orig_days": class_row["Days"],
+                "course": class_row["Course"],
+                "section": class_row["Section"],
+                "drag_started": False,
+                "ghost": None
+            }
+            
+            if self.drag_data["ghost"]:
+                try:
+                    canvas.delete(self.drag_data["ghost"])
+                except:
+                    pass
+                    
+            block_coords = canvas.coords(item)
+            if len(block_coords) == 4:
+                x1, y1, x2, y2 = block_coords
+                self.drag_data["original_geometry"] = (x1, y1, x2, y2)
+                
+                canvas.create_rectangle(
+                    x1, y1, x2, y2,
+                    outline="#3498db", dash=(4, 4), width=2,
+                    fill="", tags=("ghost_rectangle",)
+                )
+        except Exception as e:
+            print(f"Press error: {e}")
+            self.drag_data = {}
+    
+    def _on_block_drag(self, event):
+        try:
+            if not self.drag_data or "start_point" not in self.drag_data:
+                return
+                
+            canvas = event.widget
+            dx = event.x - self.drag_data["start_point"][0]
+            dy = event.y - self.drag_data["start_point"][1]
+            
+            if abs(dx) < 5 and abs(dy) < 5 and not self.drag_data.get("drag_started"):
+                return
+                
+            self.drag_data["drag_started"] = True
+            canvas.delete("ghost_rectangle")
+            
+            if "original_geometry" not in self.drag_data:
+                return
+                
+            x1, y1, x2, y2 = self.drag_data["original_geometry"]
+            
+            canvas.create_rectangle(
+                x1 + dx, y1 + dy, x2 + dx, y2 + dy,
+                outline="#3498db", dash=(4, 4), width=2,
+                fill="", tags=("ghost_rectangle",)
+            )
+            
+            self.drag_data["target_day"] = None
+            for day, day_canvas in self.day_columns.items():
+                x1 = day_canvas.winfo_rootx()
+                x2 = x1 + day_canvas.winfo_width()
+                y1 = day_canvas.winfo_rooty()
+                y2 = y1 + day_canvas.winfo_height()
+                
+                if x1 <= event.x_root <= x2 and y1 <= event.y_root <= y2:
+                    self.drag_data["target_day"] = day
+                    day_canvas.config(highlightbackground="#3498db", highlightthickness=2)
+                else:
+                    day_canvas.config(highlightbackground="#2b2b2b", highlightthickness=0)
+        except Exception as e:
+            print(f"Drag error: {e}")
+    
+    def _on_block_release(self, event):
+        try:
+            event.widget.delete("ghost_rectangle")
+            
+            if not self.drag_data or not self.drag_data.get("drag_started", False):
+                return
+                
+            dx = event.x - self.drag_data["start_point"][0]
+            dy = event.y - self.drag_data["start_point"][1]
+            
+            significant_horizontal = abs(dx) > 20
+            significant_vertical = abs(dy) > 20
+            
+            day_changed = self.drag_data.get("target_day") != self.drag_data.get("day") and significant_horizontal
+            time_changed = significant_vertical
+            
+            if day_changed:
+                self._handle_day_change()
+                
+            if time_changed:
+                self._handle_time_change()
+                
+            if day_changed or time_changed:
+                self.detect_conflicts()
+                self.show_conflict_overview()
+                if self.current_room:
+                    self.load_room_schedule(*self.current_room)
+        except Exception as e:
+            messagebox.showerror("Error", f"Error updating schedule: {str(e)}")
+        finally:
+            for canvas in self.day_columns.values():
+                canvas.config(highlightbackground="#2b2b2b", highlightthickness=0)
+                
+            self.drag_data = {}
+
+    def _handle_time_change(self):
+        try:
+            if "idx" not in self.drag_data:
+                return
+                
+            idx = self.drag_data["idx"]
+            canvas = self.drag_data.get("canvas")
+            
+            if not canvas:
+                return
+                
+            if not self.current_room:
+                return
+                
+            room_df = self.df[(self.df["Bldg"] == self.current_room[0]) &
+                            (self.df["Room"] == self.current_room[1])]
+            
+            times = pd.to_datetime(pd.concat([room_df["Start"], room_df["End"]]).dropna(), 
+                                 format="%H:%M", errors="coerce")
+            if times.empty:
+                min_time = datetime.strptime("08:00", "%H:%M")
+            else:
+                min_time = times.min().to_pydatetime()
+            
+            canvas_scroll_y = self.calendar_container.yview()[0] * self.calendar_container.winfo_height()
+            drag_y_pos = canvas.winfo_pointery() - canvas.winfo_rooty() + canvas_scroll_y
+            
+            minutes_offset = max(0, drag_y_pos // self.pixels_per_minute)
+            target_time = min_time + timedelta(minutes=minutes_offset)
+            
+            minutes = target_time.minute
+            rounded_minutes = ((minutes + 7) // 15) * 15
+            if rounded_minutes == 60:
+                target_time = target_time.replace(hour=target_time.hour + 1, minute=0)
+            else:
+                target_time = target_time.replace(minute=rounded_minutes)
+            
+            try:
+                original_start = datetime.strptime(self.df.at[idx, "Start"], "%H:%M")
+                original_end = datetime.strptime(self.df.at[idx, "End"], "%H:%M")
+                duration = original_end - original_start
+            except:
+                duration = timedelta(hours=1)
+            
+            new_end_time = target_time + duration
+            new_start = target_time.strftime("%H:%M")
+            new_end = new_end_time.strftime("%H:%M")
+            
+            if self.validate_time_change(idx, new_start, new_end):
+                course = self.df.at[idx, "Course"]
+                section = self.df.at[idx, "Section"]
+                matching_indices = self.df[(self.df["Course"] == course) & 
+                                       (self.df["Section"] == section)].index
+                
+                for match_idx in matching_indices:
+                    self.df.at[match_idx, "Start"] = new_start
+                    self.df.at[match_idx, "End"] = new_end
+                    
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to update time: {str(e)}")
+            
+    def _handle_day_change(self):
+        idx = self.drag_data["idx"]
+        target_day = self.drag_data["target_day"]
+        current_day = self.drag_data["day"]
+        
+        if target_day != current_day and target_day and current_day:
+            orig_days = self.drag_data["orig_days"]
+            course = self.df.at[idx, "Course"]
+            section = self.df.at[idx, "Section"]
+            
+            if current_day in orig_days and target_day not in orig_days:
+                new_days = orig_days.replace(current_day, current_day + target_day)
+            elif current_day in orig_days:
+                new_days = orig_days.replace(current_day, target_day)
+            else:
+                new_days = orig_days + target_day
+            
+            matching_indices = self.df[(self.df["Course"] == course) & 
+                                   (self.df["Section"] == section)].index
+                                   
+            for match_idx in matching_indices:
+                self.df.at[match_idx, "Days"] = new_days
+    
+    def validate_time_change(self, idx, new_start, new_end):
+        try:
+            start_dt = datetime.strptime(new_start, "%H:%M")
+            end_dt = datetime.strptime(new_end, "%H:%M")
+            
+            if start_dt >= end_dt:
+                messagebox.showerror("Invalid Time", "End time must be after start time.")
+                return False
+                
+            if start_dt.hour < 6 or end_dt.hour > 23:
+                result = messagebox.askyesno("Unusual Hours", 
+                                             "This class would start before 6AM or end after 11PM. Continue?")
+                if not result:
+                    return False
+            return True
+        except ValueError:
+            messagebox.showerror("Invalid Time", "Could not parse time value.")
+            return False
+    
+    def show_edit_dialog(self, idx):
+        try:
+            row = self.df.iloc[idx]
+            dialog = ctk.CTkToplevel(self.root)
+            dialog.title(f"Edit {row['Course']} ({row['Section']})")
+            dialog.geometry("500x600")
+            
+            # Main container
+            main_container = ctk.CTkFrame(dialog, fg_color="transparent")
+            main_container.pack(fill="both", expand=True, padx=20, pady=20)
+            
+            # Title
+            title = ctk.CTkLabel(
+                main_container,
+                text=f"✏️ Edit Class Details",
+                font=ctk.CTkFont(size=20, weight="bold")
+            )
+            title.pack(pady=(0, 20))
+            
+            # Form frame
+            form_frame = ctk.CTkFrame(main_container, corner_radius=10)
+            form_frame.pack(fill="both", expand=True, pady=(0, 10))
+            
+            # Days
+            ctk.CTkLabel(form_frame, text="Days:", font=ctk.CTkFont(size=13)).grid(
+                row=0, column=0, sticky="w", padx=15, pady=(15, 10))
+            days_entry = ctk.CTkEntry(form_frame, width=200, height=35)
+            days_entry.insert(0, row["Days"])
+            days_entry.grid(row=0, column=1, padx=15, pady=(15, 10), sticky="ew")
+            
+            # Start Time
+            ctk.CTkLabel(form_frame, text="Start Time:", font=ctk.CTkFont(size=13)).grid(
+                row=1, column=0, sticky="w", padx=15, pady=10)
+            start_entry = ctk.CTkEntry(form_frame, width=200, height=35)
+            start_entry.insert(0, row["Start"])
+            start_entry.grid(row=1, column=1, padx=15, pady=10, sticky="ew")
+            
+            # End Time
+            ctk.CTkLabel(form_frame, text="End Time:", font=ctk.CTkFont(size=13)).grid(
+                row=2, column=0, sticky="w", padx=15, pady=10)
+            end_entry = ctk.CTkEntry(form_frame, width=200, height=35)
+            end_entry.insert(0, row["End"])
+            end_entry.grid(row=2, column=1, padx=15, pady=10, sticky="ew")
+            
+            # Building
+            ctk.CTkLabel(form_frame, text="Building:", font=ctk.CTkFont(size=13)).grid(
+                row=3, column=0, sticky="w", padx=15, pady=10)
+            bldg_entry = ctk.CTkEntry(form_frame, width=200, height=35)
+            bldg_entry.insert(0, row["Bldg"])
+            bldg_entry.grid(row=3, column=1, padx=15, pady=10, sticky="ew")
+            
+            # Room
+            ctk.CTkLabel(form_frame, text="Room:", font=ctk.CTkFont(size=13)).grid(
+                row=4, column=0, sticky="w", padx=15, pady=(10, 15))
+            room_entry = ctk.CTkEntry(form_frame, width=200, height=35)
+            room_entry.insert(0, row["Room"])
+            room_entry.grid(row=4, column=1, padx=15, pady=(10, 15), sticky="ew")
+            
+            form_frame.grid_columnconfigure(1, weight=1)
+            
+            # Conflicts info
+            if row["Conflict"]:
+                conflict_frame = ctk.CTkFrame(main_container, corner_radius=10, fg_color="#3d1f1f")
+                conflict_frame.pack(fill="both", expand=True, pady=(0, 10))
+                
+                ctk.CTkLabel(
+                    conflict_frame,
+                    text="⚠️ Current Conflicts",
+                    font=ctk.CTkFont(size=14, weight="bold"),
+                    text_color="#ff6b6b"
+                ).pack(pady=(10, 5), padx=15, anchor="w")
+                
+                import tkinter as tk
+                conflicts_text = tk.Text(
+                    conflict_frame,
+                    height=4,
+                    width=40,
+                    wrap="word",
+                    bg="#2b2b2b",
+                    fg="white",
+                    font=('Segoe UI', 10),
+                    borderwidth=0,
+                    highlightthickness=0
+                )
+                conflicts_text.insert("1.0", row["Conflict"])
+                conflicts_text.config(state="disabled")
+                conflicts_text.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+            
+            def safe_update():
+                try:
+                    new_days = days_entry.get().strip().upper()
+                    new_start = start_entry.get().strip()
+                    new_end = end_entry.get().strip()
+                    new_bldg = bldg_entry.get().strip().upper()
+                    new_room = room_entry.get().strip().upper()
+                    
+                    if not new_days or not new_start or not new_end or not new_bldg or not new_room:
+                        messagebox.showwarning("Warning", "All fields are required!")
+                        return
+                    
+                    if not self.validate_time_change(idx, new_start, new_end):
+                        return
+                        
+                    course = row["Course"]
+                    section = row["Section"]
+                    matching_indices = self.df[(self.df["Course"] == course) & 
+                                          (self.df["Section"] == section)].index
+                    
+                    for match_idx in matching_indices:
+                        self.df.at[match_idx, "Days"] = new_days
+                        self.df.at[match_idx, "Start"] = new_start
+                        self.df.at[match_idx, "End"] = new_end
+                        self.df.at[match_idx, "Bldg"] = new_bldg
+                        self.df.at[match_idx, "Room"] = new_room
+                    
+                    self.detect_conflicts()
+                    self.show_conflict_overview()
+                    
+                    if self.current_room and self.current_room[0] == row["Bldg"] and self.current_room[1] == row["Room"]:
+                        self.load_room_schedule(new_bldg, new_room)
+                    else:
+                        self.load_room_schedule(new_bldg, new_room)
+                        
+                    dialog.destroy()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Update failed: {str(e)}")
+            
+            # Button frame
+            btn_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+            btn_frame.pack(fill="x")
+            
+            ctk.CTkButton(
+                btn_frame,
+                text="✓ Update",
+                command=safe_update,
+                height=40,
+                corner_radius=10,
+                fg_color="#2d7d46",
+                hover_color="#1f5c32",
+                font=ctk.CTkFont(size=13, weight="bold")
+            ).pack(side="left", padx=5, expand=True, fill="x")
+            
+            ctk.CTkButton(
+                btn_frame,
+                text="✕ Cancel",
+                command=dialog.destroy,
+                height=40,
+                corner_radius=10,
+                fg_color="#7d2d2d",
+                hover_color="#5c1f1f",
+                font=ctk.CTkFont(size=13, weight="bold")
+            ).pack(side="left", padx=5, expand=True, fill="x")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open edit dialog: {str(e)}")
+    
+    def filter_courses(self, event=None):
+        search_text = self.search_entry.get().lower()
+        self.search_results.delete(0, "end")
+        
+        if not search_text:
+            return
+            
+        matches = self.df[self.df["Course"].str.lower().str.contains(search_text)]
+        unique_matches = matches.drop_duplicates(subset=["Course", "Section"])
+        
+        for _, row in unique_matches.iterrows():
+            display_text = f"{row['Course']} - {row['Section']} ({row['Title']})"
+            self.search_results.insert("end", display_text)
+            
+    def on_course_select(self, event):
+        try:
+            selection = self.search_results.get(self.search_results.curselection())
+            if not selection:
+                return
+                
+            parts = selection.split(" - ")
+            if len(parts) < 2:
+                return
+                
+            course = parts[0].strip()
+            section = parts[1].split(" ")[0].strip()
+            
+            matches = self.df[(self.df["Course"] == course) & (self.df["Section"] == section)]
+            if not matches.empty:
+                first_idx = matches.index[0]
+                
+                if not self.current_room:
+                    self.load_room_schedule(matches.iloc[0]["Bldg"], matches.iloc[0]["Room"])
+                    self.bldg_entry.delete(0, "end")
+                    self.bldg_entry.insert(0, matches.iloc[0]["Bldg"])
+                    self.room_entry.delete(0, "end")
+                    self.room_entry.insert(0, matches.iloc[0]["Room"])
+                else:
+                    self.show_edit_dialog(first_idx)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not select course: {str(e)}")
+    
+    def save_file(self):
+        try:
+            if not self.file_path:
+                self.save_as_new_file()
+                return
+                
+            self.df.to_excel(self.file_path, index=False)
+            messagebox.showinfo("Success", "File saved successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save file: {str(e)}")
+            
+    def save_as_new_file(self):
+        try:
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel Files", "*.xlsx")]
+            )
+            
+            if not file_path:
+                return
+                
+            self.file_path = file_path
+            self.df.to_excel(file_path, index=False)
+            messagebox.showinfo("Success", "File saved successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save file: {str(e)}")
+
+
+if __name__ == "__main__":
+    root = ctk.CTk()
+    root.geometry("1400x900")
+    root.title("Class Schedule Manager")
+    app = ScheduleManager(root)
+    root.mainloop()
